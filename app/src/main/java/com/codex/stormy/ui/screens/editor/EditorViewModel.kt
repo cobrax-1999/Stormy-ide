@@ -246,11 +246,23 @@ class EditorViewModel(
         initialValue = EditorUiState()
     )
 
+    // Debug logging state
+    private val _debugLogsEnabled = MutableStateFlow(false)
+
     init {
         loadProject()
         loadChatHistory()
         loadAvailableModels()
         setupToolInteractionCallback()
+        observeDebugLogsPreference()
+    }
+
+    private fun observeDebugLogsPreference() {
+        viewModelScope.launch {
+            preferencesRepository.debugLogsEnabled.collect { enabled ->
+                _debugLogsEnabled.value = enabled
+            }
+        }
     }
 
     /**
@@ -1144,6 +1156,21 @@ class EditorViewModel(
         var hasToolCalls = false
         var finishedWithToolCalls = false
 
+
+        // Log the request
+        logDebugToProject(
+            "REQUEST",
+            """
+            Model: ${model.id}
+            
+            --- System Message ---
+            ${systemMessage.content}
+            
+            --- Conversation History ---
+            ${optimizedHistory.joinToString("\n\n") { "${it.role}: ${it.content}" }}
+            """.trimIndent()
+        )
+
         try {
             aiRepository.streamChat(
                 model = model,
@@ -1237,6 +1264,14 @@ class EditorViewModel(
                             // No tool calls - conversation turn complete
                             val finalContent = _streamingContent.value
                             updateLastAssistantMessage(finalContent, MessageStatus.SENT)
+
+                            // Log the response
+                            logDebugToProject(
+                                "RESPONSE",
+                                """
+                                Content: $finalContent
+                                """.trimIndent()
+                            )
 
                             // Add assistant response to history (without tool calls)
                             if (finalContent.isNotEmpty()) {
@@ -1679,6 +1714,36 @@ class EditorViewModel(
                     undoRedoManager = application.undoRedoManager,
                     semanticMemorySystem = application.semanticMemorySystem
                 ) as T
+            }
+        }
+    /**
+     * Helper to log debug info to .codex/logs.txt if enabled
+     */
+    private fun logDebugToProject(title: String, content: String) {
+        if (!_debugLogsEnabled.value) return
+        
+        val project = _project.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val logsDir = File(project.rootPath, ".codex")
+                if (!logsDir.exists()) logsDir.mkdirs()
+                
+                val logFile = File(logsDir, "logs.txt")
+                val timestamp = java.time.LocalDateTime.now().toString()
+                
+                val output = buildString {
+                    append("\n")
+                    append("=".repeat(20))
+                    append(" $title [$timestamp] ")
+                    append("=".repeat(20))
+                    append("\n")
+                    append(content)
+                    append("\n")
+                }
+                
+                logFile.appendText(output)
+            } catch (e: Exception) {
+                // Ignore logging errors to prevent detailed crashes
             }
         }
     }
