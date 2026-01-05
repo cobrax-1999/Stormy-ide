@@ -179,7 +179,22 @@ private fun splitByToolCalls(content: String): List<ContentSegment> {
     matches.forEachIndexed { idx, match ->
         val toolStart = match.range.first
         val headerEndExclusive = match.range.last + 1
-        val nextStart = matches.getOrNull(idx + 1)?.range?.first ?: content.length
+        
+        // Determine where this tool's output logically ends
+        // It ends at the next tool header, OR at the start of a thinking/reasoning block
+        val nextToolStart = matches.getOrNull(idx + 1)?.range?.first ?: content.length
+        
+        // Look for thinking/reasoning tags that might appear before the next tool
+        val tagMatch = OPEN_TAG_REGEX.find(content, headerEndExclusive)
+        
+        // If we found a tag, and it's before the next tool, that's our effective end
+        val effectiveEnd = if (tagMatch != null && tagMatch.range.first < nextToolStart) {
+            tagMatch.range.first
+        } else {
+            nextToolStart
+        }
+        
+        val toolEndExclusive = effectiveEnd
 
         if (cursor < toolStart) {
             val before = content.substring(cursor, toolStart)
@@ -194,20 +209,26 @@ private fun splitByToolCalls(content: String): List<ContentSegment> {
             else -> ToolStatus.RUNNING // ⏳ or anything else
         }
 
-        val rawOutput = content.substring(headerEndExclusive, nextStart)
+        // Extract output only up to the effective end
+        val rawOutput = if (extractOutput(content, headerEndExclusive, toolEndExclusive).isBlank() && status == ToolStatus.RUNNING) {
+            "" // Don't show empty output for running tools
+        } else {
+            content.substring(headerEndExclusive, toolEndExclusive)
+        }
+        
         val output = rawOutput.trimEnd('\n', '\r')
 
         segments.add(
             ContentSegment(
                 type = SegmentType.TOOL_CALL,
-                content = content.substring(toolStart, nextStart),
+                content = content.substring(toolStart, toolEndExclusive), // Store full raw segment
                 toolName = toolName.ifBlank { "Unknown Tool" },
                 toolStatus = status,
                 toolOutput = output
             )
         )
 
-        cursor = nextStart
+        cursor = toolEndExclusive
     }
 
     if (cursor < content.length) {
@@ -216,6 +237,11 @@ private fun splitByToolCalls(content: String): List<ContentSegment> {
     }
 
     return segments
+}
+
+private fun extractOutput(content: String, start: Int, end: Int): String {
+    if (start >= end) return ""
+    return content.substring(start, end)
 }
 
 private val TOOL_HEADER_REGEX = Regex(
