@@ -175,7 +175,6 @@ class MemoriesViewModel(
 
         viewModelScope.launch {
             try {
-            try {
                 // If the memory state has a category, use it. Otherwise default.
                 // We'll search for the existing memory to find its category if possible
                 val category = _uiState.value.editingMemory?.let { 
