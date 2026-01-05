@@ -1,6 +1,5 @@
 package com.codex.stormy.ui.components.message
 
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -14,22 +13,20 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Build
@@ -59,7 +56,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -74,10 +70,8 @@ import com.codex.stormy.ui.components.diff.CollapsibleDiffView
 import com.codex.stormy.ui.components.diff.DiffSummaryBadge
 import com.codex.stormy.ui.theme.PoppinsFontFamily
 import com.codex.stormy.utils.DiffUtils
+import java.util.Locale
 
-/**
- * Represents the current AI activity status for live indicators
- */
 enum class AiActivityStatus {
     IDLE,
     THINKING,
@@ -88,9 +82,6 @@ enum class AiActivityStatus {
     EXECUTING
 }
 
-/**
- * Parsed content block types for AI messages
- */
 sealed class MessageContentBlock {
     data class ThinkingBlock(val content: String, val isActive: Boolean = false) : MessageContentBlock()
     data class TextBlock(val content: String) : MessageContentBlock()
@@ -105,6 +96,7 @@ sealed class MessageContentBlock {
         val oldContent: String? = null,
         val newContent: String? = null
     ) : MessageContentBlock()
+
     data class CodeBlock(val code: String, val language: String?) : MessageContentBlock()
     data class ReasoningBlock(val content: String, val isActive: Boolean = false) : MessageContentBlock()
 }
@@ -113,54 +105,43 @@ enum class ToolStatus {
     RUNNING, SUCCESS, ERROR
 }
 
-/**
- * Parse AI message content into structured blocks with improved reasoning detection.
- * This parser properly separates AI text responses from tool outputs to prevent content bleeding.
- */
 fun parseAiMessageContent(content: String, isStreaming: Boolean = false): List<MessageContentBlock> {
-    val blocks = mutableListOf<MessageContentBlock>()
-    if (content.isBlank()) return blocks
+    if (content.isBlank()) return emptyList()
 
-    // Split content by tool call markers to properly separate text from tool outputs
+    val blocks = mutableListOf<MessageContentBlock>()
     val segments = splitByToolCalls(content)
 
-    for ((index, segment) in segments.withIndex()) {
+    segments.forEachIndexed { index, segment ->
         when (segment.type) {
             SegmentType.TEXT -> {
-                // Process text segment for thinking/reasoning tags
-                processTextSegment(segment.content, blocks, isStreaming && index == segments.lastIndex)
+                processTextSegment(
+                    content = segment.content,
+                    blocks = blocks,
+                    isStreaming = isStreaming && index == segments.lastIndex
+                )
             }
+
             SegmentType.TOOL_CALL -> {
-                // Add tool call block directly
-                blocks.add(MessageContentBlock.ToolCallBlock(
-                    toolName = segment.toolName ?: "Unknown Tool",
-                    status = segment.toolStatus ?: ToolStatus.RUNNING,
-                    output = segment.toolOutput,
-                    filePath = extractFilePath(segment.toolName ?: "", segment.toolOutput ?: ""),
-                    isActive = segment.toolStatus == ToolStatus.RUNNING && isStreaming
-                ))
+                val output = segment.toolOutput?.takeIf { it.isNotBlank() }
+                blocks.add(
+                    MessageContentBlock.ToolCallBlock(
+                        toolName = segment.toolName ?: "Unknown Tool",
+                        status = segment.toolStatus ?: ToolStatus.RUNNING,
+                        output = output,
+                        filePath = extractFilePath(segment.toolName.orEmpty(), output.orEmpty()),
+                        isActive = (segment.toolStatus ?: ToolStatus.RUNNING) == ToolStatus.RUNNING && isStreaming
+                    )
+                )
             }
         }
     }
 
-    // If no blocks were created, add the entire content as text
-    if (blocks.isEmpty() && content.isNotBlank()) {
-        blocks.add(MessageContentBlock.TextBlock(content))
-    }
-
-    return blocks
+    val cleaned = coalesceTextBlocks(blocks).filterNot { it is MessageContentBlock.TextBlock && it.content.isBlank() }
+    return if (cleaned.isEmpty()) listOf(MessageContentBlock.TextBlock(content)) else cleaned
 }
 
-/**
- * Segment type for content splitting
- */
-private enum class SegmentType {
-    TEXT, TOOL_CALL
-}
+private enum class SegmentType { TEXT, TOOL_CALL }
 
-/**
- * Represents a parsed segment of the AI message
- */
 private data class ContentSegment(
     val type: SegmentType,
     val content: String,
@@ -169,61 +150,69 @@ private data class ContentSegment(
     val toolOutput: String? = null
 )
 
-/**
- * Split content by tool call markers (\n\n🔧) to properly separate text from tool outputs.
- * This ensures that text responses don't bleed into tool sections.
- */
 private fun splitByToolCalls(content: String): List<ContentSegment> {
-    val segments = mutableListOf<ContentSegment>()
-
-    // Pattern to match tool calls: 🔧 **Tool Name**\n✅/❌/⏳ output
-    val toolCallPattern = Regex(
-        """🔧\s*\*\*([^*]+)\*\*\s*\n(✅|❌|⏳)\s*(.*)""",
-        setOf(RegexOption.MULTILINE)
+    val headerRegex = Regex(
+        pattern = """(?m)^\s*🔧\s*\*\*([^*]+)\*\*\s*\r?\n\s*(✅|❌|⏳)\s*""",
+        options = setOf(RegexOption.MULTILINE)
     )
 
-    // Split by tool call separator (double newline before 🔧)
-    val parts = content.split(Regex("""\n\n(?=🔧)"""))
+    val matches = headerRegex.findAll(content).toList()
+    if (matches.isEmpty()) return listOf(ContentSegment(type = SegmentType.TEXT, content = content))
 
-    for (part in parts) {
-        val trimmed = part.trim()
-        if (trimmed.isEmpty()) continue
+    val segments = mutableListOf<ContentSegment>()
+    var cursor = 0
 
-        // Check if this part is a tool call
-        val toolMatch = toolCallPattern.find(trimmed)
-        if (toolMatch != null && trimmed.startsWith("🔧")) {
-            val toolName = toolMatch.groupValues[1].trim()
-            val statusEmoji = toolMatch.groupValues[2]
-            val output = toolMatch.groupValues[3].trim()
+    for (i in matches.indices) {
+        val match = matches[i]
+        val toolStart = match.range.first
+        val outputStart = match.range.last + 1
+        val nextStart = matches.getOrNull(i + 1)?.range?.first ?: content.length
 
-            val status = when (statusEmoji) {
-                "✅" -> ToolStatus.SUCCESS
-                "❌" -> ToolStatus.ERROR
-                else -> ToolStatus.RUNNING
-            }
+        if (toolStart > cursor) {
+            segments.add(
+                ContentSegment(
+                    type = SegmentType.TEXT,
+                    content = content.substring(cursor, toolStart)
+                )
+            )
+        }
 
-            segments.add(ContentSegment(
+        val toolName = match.groupValues[1].trim()
+        val statusEmoji = match.groupValues[2]
+        val status = when (statusEmoji) {
+            "✅" -> ToolStatus.SUCCESS
+            "❌" -> ToolStatus.ERROR
+            else -> ToolStatus.RUNNING
+        }
+
+        val rawOutput = content.substring(outputStart, nextStart)
+        val output = rawOutput.trimEnd().trim('\n', '\r').ifBlank { null }
+
+        segments.add(
+            ContentSegment(
                 type = SegmentType.TOOL_CALL,
-                content = trimmed,
+                content = content.substring(toolStart, nextStart),
                 toolName = toolName,
                 toolStatus = status,
-                toolOutput = output.ifEmpty { null }
-            ))
-        } else {
-            // This is text content
-            segments.add(ContentSegment(
-                type = SegmentType.TEXT,
-                content = trimmed
-            ))
-        }
+                toolOutput = output
+            )
+        )
+
+        cursor = nextStart
     }
 
-    return segments
+    if (cursor < content.length) {
+        segments.add(
+            ContentSegment(
+                type = SegmentType.TEXT,
+                content = content.substring(cursor)
+            )
+        )
+    }
+
+    return segments.filterNot { it.content.isBlank() && it.type == SegmentType.TEXT }
 }
 
-/**
- * Process a text segment for thinking/reasoning tags
- */
 private fun processTextSegment(
     content: String,
     blocks: MutableList<MessageContentBlock>,
@@ -231,88 +220,168 @@ private fun processTextSegment(
 ) {
     if (content.isBlank()) return
 
-    var lastEnd = 0
-
-    // Pattern to match thinking/reasoning sections - multiple formats
-    val thinkingPatterns = listOf(
-        Regex("""<thinking>([\s\S]*?)</thinking>""", RegexOption.IGNORE_CASE),
-        Regex("""<think>([\s\S]*?)</think>""", RegexOption.IGNORE_CASE),
-        Regex("""<reasoning>([\s\S]*?)</reasoning>""", RegexOption.IGNORE_CASE),
-        Regex("""<reason>([\s\S]*?)</reason>""", RegexOption.IGNORE_CASE)
+    val tokenRegex = Regex(
+        pattern =
+        """```([^\n\r`]*)\r?\n([\s\S]*?)```|<thinking>([\s\S]*?)</thinking>|<think>([\s\S]*?)</think>|<reasoning>([\s\S]*?)</reasoning>|<reason>([\s\S]*?)</reason>""",
+        options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
     )
 
-    // Pattern for unclosed thinking tags (streaming)
-    val unclosedThinkingPatterns = listOf(
-        Regex("""<thinking>([\s\S]*)$""", RegexOption.IGNORE_CASE),
-        Regex("""<think>([\s\S]*)$""", RegexOption.IGNORE_CASE),
-        Regex("""<reasoning>([\s\S]*)$""", RegexOption.IGNORE_CASE),
-        Regex("""<reason>([\s\S]*)$""", RegexOption.IGNORE_CASE)
-    )
+    var cursor = 0
+    for (match in tokenRegex.findAll(content)) {
+        val start = match.range.first
+        val endExclusive = match.range.last + 1
 
-    // First, extract thinking/reasoning blocks (closed tags)
-    for (pattern in thinkingPatterns) {
-        val matches = pattern.findAll(content)
-        for (match in matches) {
-            val textBefore = content.substring(lastEnd, match.range.first).trim()
-            if (textBefore.isNotEmpty()) {
-                blocks.add(MessageContentBlock.TextBlock(textBefore))
-            }
-            blocks.add(MessageContentBlock.ReasoningBlock(
-                content = match.groupValues[1].trim(),
-                isActive = false
-            ))
-            lastEnd = match.range.last + 1
+        if (start > cursor) {
+            val text = content.substring(cursor, start)
+            if (text.isNotBlank()) blocks.add(MessageContentBlock.TextBlock(text))
         }
+
+        when {
+            match.groupValues[2].isNotEmpty() || match.groupValues[1].isNotEmpty() -> {
+                val language = match.groupValues[1].trim().ifBlank { null }
+                val code = match.groupValues[2].trimEnd()
+                blocks.add(MessageContentBlock.CodeBlock(code = code, language = language))
+            }
+
+            match.groupValues[3].isNotEmpty() -> {
+                blocks.add(MessageContentBlock.ThinkingBlock(content = match.groupValues[3].trim(), isActive = false))
+            }
+
+            match.groupValues[4].isNotEmpty() -> {
+                blocks.add(MessageContentBlock.ThinkingBlock(content = match.groupValues[4].trim(), isActive = false))
+            }
+
+            match.groupValues[5].isNotEmpty() -> {
+                blocks.add(MessageContentBlock.ReasoningBlock(content = match.groupValues[5].trim(), isActive = false))
+            }
+
+            match.groupValues[6].isNotEmpty() -> {
+                blocks.add(MessageContentBlock.ReasoningBlock(content = match.groupValues[6].trim(), isActive = false))
+            }
+        }
+
+        cursor = endExclusive
     }
 
-    // If streaming, check for unclosed thinking tags
-    if (isStreaming && lastEnd < content.length) {
-        for (pattern in unclosedThinkingPatterns) {
-            val match = pattern.find(content.substring(lastEnd))
-            if (match != null) {
-                val textBefore = content.substring(lastEnd, lastEnd + match.range.first).trim()
-                if (textBefore.isNotEmpty()) {
-                    blocks.add(MessageContentBlock.TextBlock(textBefore))
+    if (cursor < content.length) {
+        val tail = content.substring(cursor)
+
+        if (isStreaming) {
+            val open = findUnclosedReasoningOrThinking(tail)
+            if (open != null) {
+                val prefix = tail.substring(0, open.openTagStart)
+                if (prefix.isNotBlank()) blocks.add(MessageContentBlock.TextBlock(prefix))
+
+                val body = tail.substring(open.contentStart).trimEnd()
+                when (open.kind) {
+                    OpenKind.THINKING -> blocks.add(MessageContentBlock.ThinkingBlock(content = body.trim(), isActive = true))
+                    OpenKind.REASONING -> blocks.add(MessageContentBlock.ReasoningBlock(content = body.trim(), isActive = true))
                 }
-                blocks.add(MessageContentBlock.ReasoningBlock(
-                    content = match.groupValues[1].trim(),
-                    isActive = true
-                ))
-                lastEnd = content.length
-                break
+                return
             }
         }
-    }
 
-    // Process remaining content
-    if (lastEnd < content.length) {
-        val remainingText = content.substring(lastEnd).trim()
-        if (remainingText.isNotEmpty()) {
-            blocks.add(MessageContentBlock.TextBlock(remainingText))
-        }
-    } else if (lastEnd == 0 && content.isNotEmpty()) {
-        // No patterns matched, add entire content as text
+        if (tail.isNotBlank()) blocks.add(MessageContentBlock.TextBlock(tail))
+    } else if (blocks.isEmpty() && content.isNotBlank()) {
         blocks.add(MessageContentBlock.TextBlock(content))
     }
 }
 
+private enum class OpenKind { THINKING, REASONING }
 
-/**
- * Extract file path from tool output
- */
-private fun extractFilePath(toolName: String, output: String): String? {
-    val fileTools = listOf("read_file", "write_file", "create_file", "delete_file", "patch_file")
-    if (fileTools.any { toolName.lowercase().contains(it.replace("_", " ")) }) {
-        val pathPattern = Regex("""([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)""")
-        return pathPattern.find(output)?.value
+private data class UnclosedOpen(
+    val kind: OpenKind,
+    val openTagStart: Int,
+    val contentStart: Int
+)
+
+private fun findUnclosedReasoningOrThinking(text: String): UnclosedOpen? {
+    val lower = text.lowercase(Locale.ROOT)
+
+    fun findOpen(kind: OpenKind, openTags: List<String>, closeTags: List<String>): UnclosedOpen? {
+        val openIndex = openTags
+            .map { lower.indexOf(it) }
+            .filter { it >= 0 }
+            .minOrNull() ?: return null
+
+        val closeAfter = closeTags.any { tag ->
+            val close = lower.indexOf(tag, startIndex = openIndex + 1)
+            close >= 0
+        }
+        if (closeAfter) return null
+
+        val openTag = openTags.first { lower.indexOf(it) == openIndex }
+        return UnclosedOpen(kind = kind, openTagStart = openIndex, contentStart = openIndex + openTag.length)
     }
-    return null
+
+    val thinking = findOpen(
+        kind = OpenKind.THINKING,
+        openTags = listOf("<thinking>", "<think>"),
+        closeTags = listOf("</thinking>", "</think>")
+    )
+    val reasoning = findOpen(
+        kind = OpenKind.REASONING,
+        openTags = listOf("<reasoning>", "<reason>"),
+        closeTags = listOf("</reasoning>", "</reason>")
+    )
+
+    return listOfNotNull(thinking, reasoning).minByOrNull { it.openTagStart }
 }
 
-/**
- * Professional IDE-style AI message component with live status indicators
- * Displays structured content with collapsible sections for thinking, tools, and response
- */
+private fun extractFilePath(toolName: String, output: String): String? {
+    val name = toolName.lowercase(Locale.ROOT)
+
+    val fileToolKeys = listOf(
+        "read_file", "write_file", "create_file", "delete_file", "patch_file", "edit_file",
+        "read file", "write file", "create file", "delete file", "patch file", "edit file"
+    )
+
+    val isFileTool = fileToolKeys.any { key -> name.contains(key) }
+    if (!isFileTool && output.isBlank()) return null
+
+    val explicitPath = Regex("""(?im)^\s*(?:file|path)\s*[:=]\s*([^\s]+)\s*$""")
+        .find(output)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+
+    if (explicitPath != null) return explicitPath
+
+    val diffPath = Regex("""(?m)^\+\+\+\s+(?:b/)?([^\s]+)\s*$""")
+        .find(output)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+
+    if (diffPath != null) return diffPath
+
+    val generic = Regex("""(?i)(?:^|[\s"'`(])([a-z0-9_\-./\\]+?\.[a-z0-9]{1,10})(?:$|[\s"'`),.])""")
+        .find(output)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.trim()
+        ?.takeIf { it.isNotBlank() && !it.startsWith("http", ignoreCase = true) }
+
+    return generic
+}
+
+private fun coalesceTextBlocks(blocks: List<MessageContentBlock>): List<MessageContentBlock> {
+    if (blocks.isEmpty()) return blocks
+    val out = ArrayList<MessageContentBlock>(blocks.size)
+
+    for (b in blocks) {
+        val last = out.lastOrNull()
+        if (b is MessageContentBlock.TextBlock && last is MessageContentBlock.TextBlock) {
+            out[out.lastIndex] = MessageContentBlock.TextBlock(last.content + b.content)
+        } else {
+            out.add(b)
+        }
+    }
+    return out
+}
+
 @Composable
 fun AiMessageContent(
     content: String,
@@ -331,7 +400,6 @@ fun AiMessageContent(
             .animateContentSize(animationSpec = tween(200)),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Live activity indicator when streaming
         if (isStreaming) {
             LiveActivityIndicator(status = currentActivity)
         }
@@ -344,12 +412,14 @@ fun AiMessageContent(
                         isActive = block.isActive && isStreaming
                     )
                 }
+
                 is MessageContentBlock.ReasoningBlock -> {
                     ReasoningSection(
                         content = block.content,
                         isActive = block.isActive && isStreaming
                     )
                 }
+
                 is MessageContentBlock.ToolCallBlock -> {
                     ToolCallSection(
                         toolName = block.toolName,
@@ -363,6 +433,7 @@ fun AiMessageContent(
                         newContent = block.newContent
                     )
                 }
+
                 is MessageContentBlock.TextBlock -> {
                     ResponseSection(
                         content = block.content,
@@ -370,6 +441,7 @@ fun AiMessageContent(
                         isStreaming = index == parsedBlocks.lastIndex && isStreaming
                     )
                 }
+
                 is MessageContentBlock.CodeBlock -> {
                     CodeSection(
                         code = block.code,
@@ -381,9 +453,6 @@ fun AiMessageContent(
     }
 }
 
-/**
- * Live activity indicator showing what AI is currently doing
- */
 @Composable
 private fun LiveActivityIndicator(
     status: AiActivityStatus,
@@ -400,66 +469,58 @@ private fun LiveActivityIndicator(
         label = "pulse_alpha"
     )
 
-    if (status != AiActivityStatus.IDLE) {
-        Surface(
-            modifier = modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
+    if (status == AiActivityStatus.IDLE) return
+
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                // Pulsing activity dot
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(
-                            MaterialTheme.colorScheme.primary.copy(alpha = pulseAlpha)
-                        )
-                )
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = pulseAlpha))
+            )
 
-                // Activity icon
-                Icon(
-                    imageVector = when (status) {
-                        AiActivityStatus.THINKING -> Icons.Outlined.Psychology
-                        AiActivityStatus.TYPING -> Icons.Outlined.TextFields
-                        AiActivityStatus.CALLING_TOOL -> Icons.Outlined.Build
-                        AiActivityStatus.WRITING_FILE -> Icons.Outlined.Edit
-                        AiActivityStatus.READING_FILE -> Icons.Outlined.Description
-                        AiActivityStatus.EXECUTING -> Icons.Outlined.Code
-                        else -> Icons.Outlined.AutoAwesome
-                    },
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                    tint = MaterialTheme.colorScheme.primary
-                )
+            Icon(
+                imageVector = when (status) {
+                    AiActivityStatus.THINKING -> Icons.Outlined.Psychology
+                    AiActivityStatus.TYPING -> Icons.Outlined.TextFields
+                    AiActivityStatus.CALLING_TOOL -> Icons.Outlined.Build
+                    AiActivityStatus.WRITING_FILE -> Icons.Outlined.Edit
+                    AiActivityStatus.READING_FILE -> Icons.Outlined.Description
+                    AiActivityStatus.EXECUTING -> Icons.Outlined.Code
+                    else -> Icons.Outlined.AutoAwesome
+                },
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
 
-                // Activity text
-                Text(
-                    text = when (status) {
-                        AiActivityStatus.THINKING -> "Thinking..."
-                        AiActivityStatus.TYPING -> "Typing..."
-                        AiActivityStatus.CALLING_TOOL -> "Calling tool..."
-                        AiActivityStatus.WRITING_FILE -> "Writing file..."
-                        AiActivityStatus.READING_FILE -> "Reading file..."
-                        AiActivityStatus.EXECUTING -> "Executing..."
-                        else -> "Processing..."
-                    },
-                    style = MaterialTheme.typography.labelMedium,
-                    fontFamily = PoppinsFontFamily,
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
+            Text(
+                text = when (status) {
+                    AiActivityStatus.THINKING -> "Thinking..."
+                    AiActivityStatus.TYPING -> "Typing..."
+                    AiActivityStatus.CALLING_TOOL -> "Calling tool..."
+                    AiActivityStatus.WRITING_FILE -> "Writing file..."
+                    AiActivityStatus.READING_FILE -> "Reading file..."
+                    AiActivityStatus.EXECUTING -> "Executing..."
+                    else -> "Processing..."
+                },
+                style = MaterialTheme.typography.labelMedium,
+                fontFamily = PoppinsFontFamily,
+                color = MaterialTheme.colorScheme.primary
+            )
         }
     }
 }
 
-/**
- * Collapsible reasoning section - separate from thinking
- */
 @Composable
 private fun ReasoningSection(
     content: String,
@@ -511,9 +572,7 @@ private fun ReasoningSection(
                     color = MaterialTheme.colorScheme.onTertiaryContainer
                 )
 
-                if (isActive) {
-                    PulsingDots()
-                }
+                if (isActive) PulsingDots()
 
                 Spacer(modifier = Modifier.weight(1f))
 
@@ -553,9 +612,6 @@ private fun ReasoningSection(
     }
 }
 
-/**
- * Collapsible thinking section
- */
 @Composable
 private fun ThinkingSection(
     content: String,
@@ -607,9 +663,7 @@ private fun ThinkingSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                if (isActive) {
-                    PulsingDots()
-                }
+                if (isActive) PulsingDots()
 
                 Spacer(modifier = Modifier.weight(1f))
 
@@ -649,9 +703,6 @@ private fun ThinkingSection(
     }
 }
 
-/**
- * Animated pulsing dots indicator
- */
 @Composable
 private fun PulsingDots() {
     val infiniteTransition = rememberInfiniteTransition(label = "dots")
@@ -674,17 +725,32 @@ private fun PulsingDots() {
                 modifier = Modifier
                     .size(4.dp)
                     .clip(CircleShape)
-                    .background(
-                        MaterialTheme.colorScheme.tertiary.copy(alpha = alpha)
-                    )
+                    .background(MaterialTheme.colorScheme.tertiary.copy(alpha = alpha))
             )
         }
     }
 }
 
-/**
- * Tool call section with collapsible output and diff view for file operations
- */
+private data class UnifiedDiffSummary(val additions: Int, val deletions: Int)
+
+private fun computeUnifiedDiffSummary(output: String): UnifiedDiffSummary? {
+    val looksLikeDiff = output.contains("diff --git") ||
+        output.contains("\n+++") || output.startsWith("+++ ") ||
+        output.contains("\n--- ") || output.startsWith("--- ")
+
+    if (!looksLikeDiff) return null
+
+    var add = 0
+    var del = 0
+    for (line in output.lineSequence()) {
+        if (line.startsWith("+++ ") || line.startsWith("--- ")) continue
+        if (line.startsWith("+")) add++
+        else if (line.startsWith("-")) del++
+    }
+
+    return if (add == 0 && del == 0) null else UnifiedDiffSummary(add, del)
+}
+
 @Composable
 private fun ToolCallSection(
     toolName: String,
@@ -706,24 +772,54 @@ private fun ToolCallSection(
         ToolStatus.RUNNING -> MaterialTheme.colorScheme.tertiary
     }
 
-    // Check if this is a file modification tool that should show diff
-    val isFileModificationTool = toolName.lowercase().let { name ->
+    val normalizedToolName = toolName.lowercase(Locale.ROOT)
+    val isFileModificationTool = normalizedToolName.let { name ->
         name.contains("write") || name.contains("patch") ||
-        name.contains("create") || name.contains("edit") ||
-        name.contains("modify") || name.contains("update")
+            name.contains("create") || name.contains("edit") ||
+            name.contains("modify") || name.contains("update")
     }
+
     val hasDiffData = oldContent != null && newContent != null && oldContent != newContent
     val showDiffView = isFileModificationTool && hasDiffData && status == ToolStatus.SUCCESS
 
-    // Compute diff once and cache it
-    val diffResult = remember(oldContent, newContent) {
+    val diffResult = remember(showDiffView, oldContent, newContent) {
         if (showDiffView && oldContent != null && newContent != null) {
             DiffUtils.computeDiff(oldContent, newContent)
-        } else null
+        } else {
+            null
+        }
     }
 
-    val displayAdditions = if (additions > 0) additions else diffResult?.additions ?: 0
-    val displayDeletions = if (deletions > 0) deletions else diffResult?.deletions ?: 0
+    val outputDiffSummary = remember(output) {
+        output?.let(::computeUnifiedDiffSummary)
+    }
+
+    val displayAdditions = when {
+        additions > 0 -> additions
+        diffResult != null -> diffResult.additions
+        outputDiffSummary != null -> outputDiffSummary.additions
+        else -> 0
+    }
+
+    val displayDeletions = when {
+        deletions > 0 -> deletions
+        diffResult != null -> diffResult.deletions
+        outputDiffSummary != null -> outputDiffSummary.deletions
+        else -> 0
+    }
+
+    val canExpand = !output.isNullOrBlank() || showDiffView
+
+    val toolPulseTransition = rememberInfiniteTransition(label = "tool_pulse")
+    val pulsingScale by toolPulseTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(500),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "tool_scale"
+    )
 
     Surface(
         modifier = modifier.fillMaxWidth(),
@@ -739,38 +835,24 @@ private fun ToolCallSection(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(enabled = output != null || showDiffView) { isExpanded = !isExpanded }
+                    .clickable(enabled = canExpand) { isExpanded = !isExpanded }
                     .padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Tool icon with activity animation
-                Box {
-                    Icon(
-                        imageVector = getToolIcon(toolName),
-                        contentDescription = null,
-                        modifier = Modifier
-                            .size(16.dp)
-                            .then(
-                                if (isActive) {
-                                    val infiniteTransition = rememberInfiniteTransition(label = "tool_pulse")
-                                    val scale by infiniteTransition.animateFloat(
-                                        initialValue = 1f,
-                                        targetValue = 1.2f,
-                                        animationSpec = infiniteRepeatable(
-                                            animation = tween(500),
-                                            repeatMode = RepeatMode.Reverse
-                                        ),
-                                        label = "tool_scale"
-                                    )
-                                    Modifier.graphicsLayer { scaleX = scale; scaleY = scale }
-                                } else Modifier
-                            ),
-                        tint = statusColor
-                    )
-                }
+                Icon(
+                    imageVector = getToolIcon(toolName),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(16.dp)
+                        .graphicsLayer {
+                            val s = if (isActive) pulsingScale else 1f
+                            scaleX = s
+                            scaleY = s
+                        },
+                    tint = statusColor
+                )
 
-                // Tool name
                 Text(
                     text = toolName,
                     style = MaterialTheme.typography.labelMedium,
@@ -782,28 +864,26 @@ private fun ToolCallSection(
                     modifier = Modifier.weight(1f)
                 )
 
-                // File path if available
                 filePath?.let { path ->
+                    val displayName = path.substringAfterLast('/').substringAfterLast('\\')
                     Text(
-                        text = path.substringAfterLast("/"),
+                        text = displayName,
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = FontFamily.Monospace,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.width(80.dp)
+                        modifier = Modifier.width(96.dp)
                     )
                 }
 
-                // Diff summary badge for file modifications
-                if (showDiffView || (displayAdditions > 0 || displayDeletions > 0)) {
+                if (showDiffView || displayAdditions > 0 || displayDeletions > 0) {
                     DiffSummaryBadge(
                         additions = displayAdditions,
                         deletions = displayDeletions
                     )
                 }
 
-                // Status icon
                 Icon(
                     imageVector = when (status) {
                         ToolStatus.SUCCESS -> Icons.Outlined.CheckCircle
@@ -815,8 +895,7 @@ private fun ToolCallSection(
                     tint = statusColor
                 )
 
-                // Expand indicator if there's output or diff
-                if (output != null || showDiffView) {
+                if (canExpand) {
                     Icon(
                         imageVector = if (isExpanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
                         contentDescription = null,
@@ -827,7 +906,7 @@ private fun ToolCallSection(
             }
 
             AnimatedVisibility(
-                visible = isExpanded && (output != null || showDiffView),
+                visible = isExpanded && canExpand,
                 enter = expandVertically() + fadeIn(),
                 exit = shrinkVertically() + fadeOut()
             ) {
@@ -837,12 +916,11 @@ private fun ToolCallSection(
                         modifier = Modifier.padding(horizontal = 10.dp)
                     )
 
-                    // Show diff view for file modifications
                     if (showDiffView) {
                         CollapsibleDiffView(
                             filePath = filePath ?: "file",
-                            oldContent = oldContent ?: "",
-                            newContent = newContent ?: "",
+                            oldContent = oldContent.orEmpty(),
+                            newContent = newContent.orEmpty(),
                             toolName = toolName,
                             isSuccess = status == ToolStatus.SUCCESS,
                             modifier = Modifier.padding(8.dp),
@@ -850,8 +928,7 @@ private fun ToolCallSection(
                         )
                     }
 
-                    // Show text output if available (and not just diff)
-                    if (output != null && (!showDiffView || output.isNotBlank())) {
+                    if (!output.isNullOrBlank() && (!showDiffView || output.isNotBlank())) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -876,11 +953,8 @@ private fun ToolCallSection(
     }
 }
 
-/**
- * Get appropriate icon for tool type
- */
 private fun getToolIcon(toolName: String): ImageVector {
-    val name = toolName.lowercase()
+    val name = toolName.lowercase(Locale.ROOT)
     return when {
         name.contains("read") && name.contains("file") -> Icons.Outlined.Description
         name.contains("write") || name.contains("create") || name.contains("patch") -> Icons.Outlined.Edit
@@ -891,9 +965,6 @@ private fun getToolIcon(toolName: String): ImageVector {
     }
 }
 
-/**
- * Response text section with markdown rendering and Poppins font
- */
 @Composable
 private fun ResponseSection(
     content: String,
@@ -905,7 +976,6 @@ private fun ResponseSection(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // Markdown rendered content
         MarkdownText(
             markdown = content,
             modifier = Modifier.fillMaxWidth(),
@@ -913,7 +983,6 @@ private fun ResponseSection(
             linkColor = MaterialTheme.colorScheme.primary
         )
 
-        // Timestamp and streaming indicator
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -937,9 +1006,6 @@ private fun ResponseSection(
     }
 }
 
-/**
- * Streaming indicator with animated dots
- */
 @Composable
 private fun StreamingIndicator() {
     val infiniteTransition = rememberInfiniteTransition(label = "stream_pulse")
@@ -972,9 +1038,6 @@ private fun StreamingIndicator() {
     }
 }
 
-/**
- * Code block section with syntax highlighting appearance
- */
 @Composable
 private fun CodeSection(
     code: String,
@@ -999,7 +1062,7 @@ private fun CodeSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = language?.uppercase() ?: "CODE",
+                    text = language?.trim()?.takeIf { it.isNotBlank() }?.uppercase(Locale.ROOT) ?: "CODE",
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
