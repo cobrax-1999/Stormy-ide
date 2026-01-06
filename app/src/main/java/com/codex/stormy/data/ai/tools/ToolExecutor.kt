@@ -117,7 +117,7 @@ class ToolExecutor(
 
     // Session-based todo storage
     // Session-based todo storage removed in favor of persistent storage
-    // private val sessionTodos = mutableMapOf<String, MutableList<TodoItem>>()
+    private val sessionTodos = mutableMapOf<String, MutableList<TodoItem>>()
 
     // Interaction callback for user input and notifications
     var interactionCallback: ToolInteractionCallback? = null
