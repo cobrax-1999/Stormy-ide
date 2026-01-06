@@ -1716,6 +1716,7 @@ class EditorViewModel(
                 ) as T
             }
         }
+    }
     /**
      * Helper to log debug info to .codex/logs.txt if enabled
      */
