@@ -12,6 +12,7 @@ import com.codex.stormy.data.ai.AiModel
 import com.codex.stormy.data.ai.AssistantMessageWithToolCalls
 import com.codex.stormy.data.ai.ChatRequestMessage
 import com.codex.stormy.data.ai.StreamEvent
+import com.codex.stormy.data.ai.FunctionCall
 import com.codex.stormy.data.ai.ToolCallResponse
 import com.codex.stormy.data.ai.context.ContextUsageLevel
 import com.codex.stormy.data.ai.context.ContextWindowManager
@@ -1158,17 +1159,27 @@ class EditorViewModel(
         var finishedWithToolCalls = false
 
 
-        // Log the request
+        // Log the request with full details
         logDebugToProject(
             "REQUEST",
             """
             Model: ${model.id}
-            
+            Agent Mode: $isAgentMode
+            Tools Enabled: ${tools != null}
+            Tool Count: ${tools?.size ?: 0}
+            Iteration: $_agentIterationCount
+            Message Count: ${messagesWithSystem.size}
+
             --- System Message ---
             ${systemMessage.content}
-            
-            --- Conversation History ---
-            ${optimizedHistory.joinToString("\n\n") { "${it.role}: ${it.content}" }}
+
+            --- Conversation History (${optimizedHistory.size} messages) ---
+            ${optimizedHistory.mapIndexed { idx, msg ->
+                "[$idx] ${msg.role.uppercase()}${if (msg.toolCallId != null) " (tool_call_id: ${msg.toolCallId})" else ""}:\n${msg.content?.take(500)}${if ((msg.content?.length ?: 0) > 500) "... [truncated]" else ""}"
+            }.joinToString("\n\n")}
+
+            --- Tools Available ---
+            ${tools?.joinToString(", ") { it.function.name } ?: "None"}
             """.trimIndent()
         )
 
@@ -1187,7 +1198,12 @@ class EditorViewModel(
 
                 when (event) {
                     is StreamEvent.Started -> {
-                        // Streaming started
+                        // Streaming started - log initial event
+                        logDebugToProject("SSE_STARTED", "Streaming started for model: ${model.id}")
+                    }
+                    is StreamEvent.RawSSE -> {
+                        // Log raw SSE data for debugging
+                        logDebugRawSSE(event.data)
                     }
                     is StreamEvent.ContentDelta -> {
                         // Handle content delta - may contain inline <think> tags from some models
@@ -1262,30 +1278,48 @@ class EditorViewModel(
                                 loadFileTree()
                             }
                         } else {
-                            // No tool calls - conversation turn complete
+                            // No native tool calls - check for text-based tool calls as fallback
                             val finalContent = _streamingContent.value
-                            updateLastAssistantMessage(finalContent, MessageStatus.SENT)
+                            val textToolCalls = parseTextBasedToolCalls(finalContent)
 
-                            // Log the response
-                            logDebugToProject(
-                                "RESPONSE",
-                                """
-                                Content: $finalContent
-                                """.trimIndent()
-                            )
+                            if (textToolCalls.isNotEmpty() && _agentMode.value) {
+                                // Found text-based tool calls - execute them
+                                val shouldContinue = handleToolCalls(textToolCalls)
 
-                            // Add assistant response to history (without tool calls)
-                            if (finalContent.isNotEmpty()) {
-                                _messageHistory.add(
-                                    ChatRequestMessage(
-                                        role = "assistant",
-                                        content = finalContent
-                                    )
+                                if (shouldContinue && !_taskCompleted && !_isGenerationCancelled) {
+                                    // Continue the agentic loop
+                                    sendAiRequest()
+                                } else {
+                                    // Task completed or agent stopped
+                                    updateLastAssistantMessage(_streamingContent.value, MessageStatus.SENT)
+                                    _isAiProcessing.value = false
+                                    loadFileTree()
+                                }
+                            } else {
+                                // No tool calls - conversation turn complete
+                                updateLastAssistantMessage(finalContent, MessageStatus.SENT)
+
+                                // Log the response
+                                logDebugToProject(
+                                    "RESPONSE",
+                                    """
+                                    Content: $finalContent
+                                    """.trimIndent()
                                 )
-                            }
 
-                            _isAiProcessing.value = false
-                            loadFileTree()
+                                // Add assistant response to history (without tool calls)
+                                if (finalContent.isNotEmpty()) {
+                                    _messageHistory.add(
+                                        ChatRequestMessage(
+                                            role = "assistant",
+                                            content = finalContent
+                                        )
+                                    )
+                                }
+
+                                _isAiProcessing.value = false
+                                loadFileTree()
+                            }
                         }
                     }
                 }
@@ -1692,9 +1726,138 @@ class EditorViewModel(
         _chatInput.value = prompt
     }
 
+    /**
+     * Parse text-based tool calls from model output as a fallback when native function calling is not used.
+     * Some models output tool calls as text instead of using the OpenAI function calling API.
+     *
+     * Supported patterns:
+     * 1. JSON code blocks: ```json {"name": "tool_name", "arguments": {...}} ```
+     * 2. Tool name headers: **write_file** or `write_file` followed by JSON
+     * 3. Function call syntax: write_file(path="...", content="...")
+     */
+    private fun parseTextBasedToolCalls(content: String): List<ToolCallResponse> {
+        val toolCalls = mutableListOf<ToolCallResponse>()
+        val knownTools = StormyTools.getToolNames()
+
+        // Pattern 1: JSON code blocks with tool calls
+        val jsonBlockRegex = Regex("""```(?:json)?\s*\{[^}]*"(?:name|function)":\s*"([^"]+)"[^}]*\}[^`]*```""", RegexOption.DOT_MATCHES_ALL)
+        jsonBlockRegex.findAll(content).forEach { match ->
+            try {
+                val jsonStr = match.value.replace("```json", "").replace("```", "").trim()
+                parseToolCallJson(jsonStr, knownTools)?.let { toolCalls.add(it) }
+            } catch (e: Exception) {
+                // Ignore parsing errors
+            }
+        }
+
+        // Pattern 2: Detect inline JSON for tool calls (e.g., {"type": "function", "function": {"name": "write_file", ...}})
+        val inlineJsonRegex = Regex("""\{[^{}]*"function":\s*\{[^{}]*"name":\s*"([^"]+)"[^}]*\}[^}]*\}""")
+        inlineJsonRegex.findAll(content).forEach { match ->
+            try {
+                parseToolCallJson(match.value, knownTools)?.let { toolCalls.add(it) }
+            } catch (e: Exception) {
+                // Ignore parsing errors
+            }
+        }
+
+        // Pattern 3: Function call syntax (function_name(param1="value1", param2="value2"))
+        for (toolName in knownTools) {
+            val funcCallRegex = Regex("""$toolName\s*\(\s*([^)]*)\s*\)""")
+            funcCallRegex.findAll(content).forEach { match ->
+                try {
+                    val argsStr = match.groupValues[1]
+                    val argsMap = parseFunctionArguments(argsStr)
+                    if (argsMap.isNotEmpty()) {
+                        val jsonArgs = kotlinx.serialization.json.Json.encodeToString(
+                            kotlinx.serialization.json.JsonObject.serializer(),
+                            kotlinx.serialization.json.JsonObject(argsMap.mapValues {
+                                kotlinx.serialization.json.JsonPrimitive(it.value)
+                            })
+                        )
+                        toolCalls.add(
+                            ToolCallResponse(
+                                id = "text_${System.currentTimeMillis()}_${toolCalls.size}",
+                                type = "function",
+                                function = FunctionCall(name = toolName, arguments = jsonArgs)
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    // Ignore parsing errors
+                }
+            }
+        }
+
+        return toolCalls.distinctBy { "${it.function.name}_${it.function.arguments}" }
+    }
+
+    /**
+     * Parse a JSON string into a ToolCallResponse
+     */
+    private fun parseToolCallJson(jsonStr: String, knownTools: List<String>): ToolCallResponse? {
+        return try {
+            val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true; isLenient = true }
+            val element = json.parseToJsonElement(jsonStr)
+
+            when {
+                // Format: {"function": {"name": "...", "arguments": {...}}}
+                element is kotlinx.serialization.json.JsonObject && element.containsKey("function") -> {
+                    val func = element["function"]?.let { it as? kotlinx.serialization.json.JsonObject }
+                    val name = func?.get("name")?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }
+                    val args = func?.get("arguments")
+
+                    if (name != null && knownTools.contains(name)) {
+                        ToolCallResponse(
+                            id = "text_${System.currentTimeMillis()}",
+                            type = "function",
+                            function = FunctionCall(
+                                name = name,
+                                arguments = args?.toString() ?: "{}"
+                            )
+                        )
+                    } else null
+                }
+                // Format: {"name": "...", "arguments": {...}}
+                element is kotlinx.serialization.json.JsonObject && element.containsKey("name") -> {
+                    val name = element["name"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }
+                    val args = element["arguments"]
+
+                    if (name != null && knownTools.contains(name)) {
+                        ToolCallResponse(
+                            id = "text_${System.currentTimeMillis()}",
+                            type = "function",
+                            function = FunctionCall(
+                                name = name,
+                                arguments = args?.toString() ?: "{}"
+                            )
+                        )
+                    } else null
+                }
+                else -> null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Parse function-style arguments: param1="value1", param2="value2"
+     */
+    private fun parseFunctionArguments(argsStr: String): Map<String, String> {
+        val args = mutableMapOf<String, String>()
+
+        // Match param="value" or param='value' patterns
+        val argRegex = Regex("""(\w+)\s*=\s*["']([^"']*?)["']""")
+        argRegex.findAll(argsStr).forEach { match ->
+            args[match.groupValues[1]] = match.groupValues[2]
+        }
+
+        return args
+    }
+
     companion object {
         private const val MAX_AGENT_ITERATIONS = 25 // Prevent infinite loops
-        private const val STREAMING_UPDATE_INTERVAL_MS = 50L // Debounce interval for streaming updates (20 FPS)
+        private const val STREAMING_UPDATE_INTERVAL_MS = 100L // Debounce interval for streaming updates (10 FPS - better for performance)
 
         val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
@@ -1719,20 +1882,47 @@ class EditorViewModel(
         }
     }
     /**
-     * Helper to log debug info to .codex/logs.txt if enabled
+     * Log raw SSE data to a separate raw log file.
+     * This provides unformatted server responses for debugging.
      */
-    private fun logDebugToProject(title: String, content: String) {
+    private fun logDebugRawSSE(data: String) {
         if (!_debugLogsEnabled.value) return
-        
+
         val project = _project.value ?: return
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val logsDir = File(project.rootPath, ".codex")
                 if (!logsDir.exists()) logsDir.mkdirs()
-                
+
+                // Use separate file for raw SSE data
+                val rawLogFile = File(logsDir, "raw_sse.log")
+                val timestamp = java.time.LocalDateTime.now().format(
+                    java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+                )
+
+                // Append raw data with minimal formatting
+                rawLogFile.appendText("[$timestamp] $data\n")
+            } catch (e: Exception) {
+                // Ignore logging errors
+            }
+        }
+    }
+
+    /**
+     * Helper to log debug info to .codex/logs.txt if enabled
+     */
+    private fun logDebugToProject(title: String, content: String) {
+        if (!_debugLogsEnabled.value) return
+
+        val project = _project.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val logsDir = File(project.rootPath, ".codex")
+                if (!logsDir.exists()) logsDir.mkdirs()
+
                 val logFile = File(logsDir, "logs.txt")
                 val timestamp = java.time.LocalDateTime.now().toString()
-                
+
                 val output = buildString {
                     append("\n")
                     append("=".repeat(20))
@@ -1742,7 +1932,7 @@ class EditorViewModel(
                     append(content)
                     append("\n")
                 }
-                
+
                 logFile.appendText(output)
             } catch (e: Exception) {
                 // Ignore logging errors to prevent detailed crashes
