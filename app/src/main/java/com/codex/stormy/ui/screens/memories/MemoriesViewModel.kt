@@ -4,7 +4,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.codex.stormy.CodeXApplication
-import com.codex.stormy.data.ai.tools.MemoryStorage
+import com.codex.stormy.data.ai.memory.MemoryCategory
+import com.codex.stormy.data.ai.memory.MemoryImportance
+import com.codex.stormy.data.ai.memory.MemorySource
+import com.codex.stormy.data.ai.memory.SemanticMemorySystem
 import com.codex.stormy.data.repository.ProjectRepository
 import com.codex.stormy.domain.model.Project
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -40,7 +43,8 @@ data class ProjectMemoryState(
 data class MemoryState(
     val key: String,
     val value: String,
-    val timestamp: Long
+    val timestamp: Long,
+    val category: MemoryCategory = MemoryCategory.GENERAL_NOTES
 )
 
 /**
@@ -58,7 +62,7 @@ data class EditingMemoryState(
  * Handles loading, creating, editing, and deleting AI memories
  */
 class MemoriesViewModel(
-    private val memoryStorage: MemoryStorage,
+    private val semanticMemorySystem: SemanticMemorySystem,
     private val projectRepository: ProjectRepository
 ) : ViewModel() {
 
@@ -111,15 +115,15 @@ class MemoriesViewModel(
      * Load memories for a specific project
      */
     private suspend fun loadProjectMemories(project: Project): ProjectMemoryState {
-        val memoriesMap = memoryStorage.list(project.id)
+        val semanticMemories = semanticMemorySystem.getAllMemories(project.id)
 
         // Convert to MemoryState list
-        val memories = memoriesMap.map { (key, value) ->
-            // Try to get timestamp from storage (stored internally)
+        val memories = semanticMemories.map { memory ->
             MemoryState(
-                key = key,
-                value = value,
-                timestamp = getMemoryTimestamp(project.id, key)
+                key = memory.key,
+                value = memory.value,
+                timestamp = memory.createdAt,
+                category = memory.category
             )
         }.sortedByDescending { it.timestamp }
 
@@ -130,14 +134,8 @@ class MemoriesViewModel(
         )
     }
 
-    /**
-     * Get timestamp for a memory (approximate based on storage)
-     */
-    private suspend fun getMemoryTimestamp(projectId: String, key: String): Long {
-        // For now, return current time as we don't store timestamps externally
-        // In production, this could be enhanced to store timestamps
-        return System.currentTimeMillis() - (key.hashCode() % 86400000).toLong().coerceAtLeast(0)
-    }
+    // Helper for approximate timestamp is no longer needed as SemanticMemory has createdAt
+
 
     /**
      * Select a project to expand/collapse
@@ -177,7 +175,42 @@ class MemoriesViewModel(
 
         viewModelScope.launch {
             try {
-                memoryStorage.save(editingMemory.projectId, key, newValue)
+                // If the memory state has a category, use it. Otherwise default.
+                // We'll search for the existing memory to find its category if possible
+                val category = _uiState.value.editingMemory?.let { 
+                     // This is simplified; ideally EditingMemoryState would store the category too.
+                     // For now, assume GENERAL_NOTES or try to recall to match? 
+                     // Since we are replacing based on Key, we might need the original category.
+                     // But SemanticMemorySystem uses Category:Key as ID.
+                     // So if we change the key, we might create a new memory.
+                     // IMPORTANT: The UI assumes Key is the ID.
+                     // Let's stick to GENERAL_NOTES for simplified UI editing or pass category if we can.
+                     MemoryCategory.GENERAL_NOTES 
+                } ?: MemoryCategory.GENERAL_NOTES
+
+                // Note: SemanticMemorySystem needs Category to update the specific memory.
+                // If we don't know the category, we might create a duplicate in GENERAL_NOTES.
+                // Improvement: Fetch the memory first to get its category.
+                
+                // For this fix, let's look up the memory by key first to get its category?
+                // Or better, let's assume we are just doing a basic save.
+                // But wait, the list view knows the category.
+                
+                // Let's update `EditingMemoryState` too? No, let's keep it simple for now and rely on future improvements.
+                // We'll try to find it in the current UI state to get the category.
+                
+                val currentProjectMemories = _uiState.value.projectMemories.find { it.projectId == editingMemory.projectId }
+                val originalMemory = currentProjectMemories?.memories?.find { it.key == key }
+                val targetCategory = originalMemory?.category ?: MemoryCategory.GENERAL_NOTES
+
+                semanticMemorySystem.saveMemory(
+                    projectId = editingMemory.projectId,
+                    category = targetCategory,
+                    key = key,
+                    value = newValue,
+                    importance = MemoryImportance.MEDIUM,
+                    source = MemorySource.USER_EXPLICIT
+                )
                 _uiState.update { it.copy(editingMemory = null) }
                 loadMemories()
             } catch (e: Exception) {
@@ -196,7 +229,14 @@ class MemoriesViewModel(
 
         viewModelScope.launch {
             try {
-                memoryStorage.save(projectId, key, value)
+                semanticMemorySystem.saveMemory(
+                    projectId = projectId,
+                    category = MemoryCategory.GENERAL_NOTES,
+                    key = key,
+                    value = value,
+                    importance = MemoryImportance.MEDIUM,
+                    source = MemorySource.USER_EXPLICIT
+                )
                 loadMemories()
             } catch (e: Exception) {
                 _uiState.update { state ->
@@ -212,7 +252,12 @@ class MemoriesViewModel(
     fun deleteMemory(projectId: String, key: String) {
         viewModelScope.launch {
             try {
-                memoryStorage.delete(projectId, key)
+                // Find category to delete
+                val projectMemories = _uiState.value.projectMemories.find { it.projectId == projectId }
+                val memory = projectMemories?.memories?.find { it.key == key }
+                val category = memory?.category ?: MemoryCategory.GENERAL_NOTES
+                
+                semanticMemorySystem.deleteMemory(projectId, category, key)
                 loadMemories()
             } catch (e: Exception) {
                 _uiState.update { state ->
@@ -228,7 +273,7 @@ class MemoriesViewModel(
     fun clearProjectMemories(projectId: String) {
         viewModelScope.launch {
             try {
-                memoryStorage.clearProject(projectId)
+                semanticMemorySystem.clearProjectMemories(projectId)
                 loadMemories()
             } catch (e: Exception) {
                 _uiState.update { state ->
@@ -251,7 +296,7 @@ class MemoriesViewModel(
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
                 val application = CodeXApplication.getInstance()
                 return MemoriesViewModel(
-                    memoryStorage = application.memoryStorage,
+                    semanticMemorySystem = application.semanticMemorySystem,
                     projectRepository = application.projectRepository
                 ) as T
             }

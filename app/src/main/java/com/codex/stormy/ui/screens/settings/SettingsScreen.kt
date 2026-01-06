@@ -204,6 +204,17 @@ fun SettingsScreen(
                     value = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
                 )
             }
+            
+            // Beta Section
+            SettingsSection(title = "Beta") {
+                 SettingsToggle(
+                    icon = Icons.Outlined.Code, // Reusing Code icon or maybe Bug icon if available
+                    title = "Debug Logs",
+                    description = "Save raw AI interactions to .codex/logs.txt in project",
+                    checked = uiState.debugLogsEnabled,
+                    onCheckedChange = viewModel::setDebugLogsEnabled
+                )
+            }
 
             Spacer(modifier = Modifier.height(32.dp))
         }

@@ -36,6 +36,9 @@ class PreferencesRepository(private val context: Context) {
         val HAS_SET_DEFAULT_MODEL = booleanPreferencesKey("has_set_default_model")
 
         val ONBOARDING_COMPLETED = booleanPreferencesKey("onboarding_completed")
+
+        // Beta Features
+        val DEBUG_LOGS_ENABLED = booleanPreferencesKey("debug_logs_enabled")
     }
 
     val themeMode: Flow<ThemeMode> = context.dataStore.data.map { preferences ->
@@ -193,6 +196,16 @@ class PreferencesRepository(private val context: Context) {
     suspend fun setOnboardingCompleted(completed: Boolean) {
         context.dataStore.edit { preferences ->
             preferences[PreferenceKeys.ONBOARDING_COMPLETED] = completed
+        }
+    }
+
+    val debugLogsEnabled: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[PreferenceKeys.DEBUG_LOGS_ENABLED] ?: false
+    }
+
+    suspend fun setDebugLogsEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferenceKeys.DEBUG_LOGS_ENABLED] = enabled
         }
     }
 }

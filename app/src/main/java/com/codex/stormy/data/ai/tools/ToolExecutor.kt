@@ -14,6 +14,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
@@ -24,6 +27,7 @@ import java.util.concurrent.CancellationException
 /**
  * Todo item for task tracking
  */
+@Serializable
 data class TodoItem(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
@@ -31,6 +35,7 @@ data class TodoItem(
     var status: TodoStatus = TodoStatus.PENDING
 )
 
+@Serializable
 enum class TodoStatus {
     PENDING,
     IN_PROGRESS,
@@ -111,6 +116,7 @@ class ToolExecutor(
     }
 
     // Session-based todo storage
+    // Session-based todo storage removed in favor of persistent storage
     private val sessionTodos = mutableMapOf<String, MutableList<TodoItem>>()
 
     // Interaction callback for user input and notifications
@@ -965,8 +971,9 @@ class ToolExecutor(
             description = description
         )
 
-        val todos = sessionTodos.getOrPut(projectId) { mutableListOf() }
+        val todos = loadTodos(projectId).toMutableList()
         todos.add(todo)
+        saveTodos(projectId, todos)
 
         // Notify callback about new todo
         interactionCallback?.onTodoCreated(todo)
@@ -987,11 +994,12 @@ class ToolExecutor(
             else -> return ToolResult(false, "", "Invalid status. Use: pending, in_progress, or completed")
         }
 
-        val todos = sessionTodos[projectId] ?: return ToolResult(false, "", "No todos found")
+        val todos = loadTodos(projectId).toMutableList()
         val todo = todos.find { it.id.startsWith(todoId) || it.id == todoId }
             ?: return ToolResult(false, "", "Todo not found: $todoId")
 
         todo.status = status
+        saveTodos(projectId, todos)
 
         // Notify callback about todo update
         interactionCallback?.onTodoUpdated(todo)
@@ -999,10 +1007,10 @@ class ToolExecutor(
         return ToolResult(true, "Todo updated: [${todo.id.take(8)}] ${todo.title} -> $status")
     }
 
-    private fun executeListTodos(projectId: String): ToolResult {
-        val todos = sessionTodos[projectId]
-        if (todos.isNullOrEmpty()) {
-            return ToolResult(true, "No todos for this session")
+    private suspend fun executeListTodos(projectId: String): ToolResult {
+        val todos = loadTodos(projectId)
+        if (todos.isEmpty()) {
+            return ToolResult(true, "No todos found. Use create_todo to add one.")
         }
 
         val output = buildString {
@@ -1021,6 +1029,30 @@ class ToolExecutor(
         }
 
         return ToolResult(true, output)
+    }
+
+    private suspend fun loadTodos(projectId: String): List<TodoItem> {
+        val path = ".codex/todos.json"
+        return projectRepository.readFile(projectId, path).fold(
+            onSuccess = { content ->
+                try {
+                    json.decodeFromString<List<TodoItem>>(content)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+            },
+            onFailure = { emptyList() }
+        )
+    }
+
+    private suspend fun saveTodos(projectId: String, todos: List<TodoItem>) {
+        val path = ".codex/todos.json"
+        
+        // Ensure directory exists
+        projectRepository.createFolder(projectId, ".codex")
+        
+        val content = json.encodeToString(todos)
+        projectRepository.writeFile(projectId, path, content)
     }
 
     // ==================== Agent Control ====================
