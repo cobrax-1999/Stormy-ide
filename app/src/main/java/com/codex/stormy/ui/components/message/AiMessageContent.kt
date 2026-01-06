@@ -488,15 +488,32 @@ fun AiMessageContent(
     currentActivity: AiActivityStatus = AiActivityStatus.IDLE,
     modifier: Modifier = Modifier
 ) {
-    val parsedBlocks = remember(content, isStreaming) { parseAiMessageContent(content, isStreaming) }
+    // During streaming, use simpler parsing to reduce lag
+    // Full parsing is only done when content length changes significantly or streaming stops
+    val shouldDoFullParsing = !isStreaming || content.length < 500
+
+    val parsedBlocks = remember(content, isStreaming, shouldDoFullParsing) {
+        if (shouldDoFullParsing) {
+            parseAiMessageContent(content, isStreaming)
+        } else {
+            // During streaming with large content, just do minimal parsing
+            parseStreamingContent(content)
+        }
+    }
+
+    // Check if content is empty/minimal (only show generating indicator when truly empty)
+    val hasSubstantialContent = content.trim().length > 10 || parsedBlocks.isNotEmpty()
 
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .animateContentSize(animationSpec = tween(200)),
+            .animateContentSize(animationSpec = tween(150)),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        if (isStreaming) LiveActivityIndicator(status = currentActivity)
+        // Show minimal generating indicator only when streaming with no substantial content
+        if (isStreaming && !hasSubstantialContent) {
+            MinimalGeneratingIndicator()
+        }
 
         parsedBlocks.forEach { block ->
             when (block) {
@@ -527,6 +544,11 @@ fun AiMessageContent(
             }
         }
 
+        // Show inline generating indicator at the end when streaming with content
+        if (isStreaming && hasSubstantialContent) {
+            InlineGeneratingIndicator()
+        }
+
         Spacer(Modifier.height(2.dp))
         Text(
             text = timestamp,
@@ -537,41 +559,122 @@ fun AiMessageContent(
     }
 }
 
-@Composable
-private fun LiveActivityIndicator(
-    status: AiActivityStatus,
-    modifier: Modifier = Modifier
-) {
-    val (icon, label) = when (status) {
-        AiActivityStatus.THINKING -> Icons.Outlined.Psychology to "Thinking"
-        AiActivityStatus.TYPING -> Icons.Outlined.TextFields to "Typing"
-        AiActivityStatus.CALLING_TOOL -> Icons.Outlined.Build to "Calling tool"
-        AiActivityStatus.EXECUTING -> Icons.Outlined.Code to "Executing"
-        AiActivityStatus.READING_FILE -> Icons.Outlined.Description to "Reading file"
-        AiActivityStatus.WRITING_FILE -> Icons.Outlined.FolderOpen to "Writing file"
-        else -> Icons.Outlined.AutoAwesome to "Working"
+/**
+ * Simplified parsing for streaming content to reduce CPU usage during streaming.
+ * Only performs basic text/code fence detection without heavy regex parsing.
+ */
+private fun parseStreamingContent(content: String): List<MessageContentBlock> {
+    // During streaming, just show content as text with basic code fence support
+    val blocks = mutableListOf<MessageContentBlock>()
+
+    // Simple check for code fences
+    val fencePattern = Regex("""```(\w+)?\n([\s\S]*?)```""")
+    var lastEnd = 0
+
+    fencePattern.findAll(content).forEach { match ->
+        // Add text before code block
+        if (match.range.first > lastEnd) {
+            val text = content.substring(lastEnd, match.range.first).trim()
+            if (text.isNotEmpty()) {
+                blocks.add(MessageContentBlock.TextBlock(text))
+            }
+        }
+
+        // Add code block
+        val lang = match.groupValues[1].takeIf { it.isNotEmpty() }
+        val code = match.groupValues[2]
+        blocks.add(MessageContentBlock.CodeBlock(code = code, language = lang, isActive = false))
+
+        lastEnd = match.range.last + 1
     }
 
-    Surface(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh
+    // Add remaining text
+    if (lastEnd < content.length) {
+        val remaining = content.substring(lastEnd).trim()
+        if (remaining.isNotEmpty()) {
+            // Check if we have an unclosed code fence (streaming)
+            val unclosedFence = Regex("""```(\w+)?\n([\s\S]*)$""").find(remaining)
+            if (unclosedFence != null) {
+                val textBefore = remaining.substring(0, unclosedFence.range.first).trim()
+                if (textBefore.isNotEmpty()) {
+                    blocks.add(MessageContentBlock.TextBlock(textBefore))
+                }
+                val lang = unclosedFence.groupValues[1].takeIf { it.isNotEmpty() }
+                val code = unclosedFence.groupValues[2]
+                blocks.add(MessageContentBlock.CodeBlock(code = code, language = lang, isActive = true))
+            } else {
+                blocks.add(MessageContentBlock.TextBlock(remaining))
+            }
+        }
+    }
+
+    return if (blocks.isEmpty()) listOf(MessageContentBlock.TextBlock(content)) else blocks
+}
+
+/**
+ * Minimal generating indicator - shown when AI is generating but no content yet
+ * Clean, modern design similar to popular AI chat apps
+ */
+@Composable
+private fun MinimalGeneratingIndicator(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier.padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.tertiary, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(10.dp))
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-                fontFamily = PoppinsFontFamily,
-                fontWeight = FontWeight.Medium
+        Text(
+            text = "Generating",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontFamily = PoppinsFontFamily
+        )
+        GeneratingDots()
+    }
+}
+
+/**
+ * Inline generating indicator - shown at the end of content when streaming
+ * Very subtle, just shows that more content is coming
+ */
+@Composable
+private fun InlineGeneratingIndicator(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier.padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        GeneratingDots(dotSize = 4.dp)
+    }
+}
+
+/**
+ * Animated dots for generating indicator
+ * Smooth, minimal animation that doesn't distract
+ */
+@Composable
+private fun GeneratingDots(
+    modifier: Modifier = Modifier,
+    dotSize: androidx.compose.ui.unit.Dp = 5.dp
+) {
+    val infinite = rememberInfiniteTransition(label = "generating_dots")
+    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+        repeat(3) { index ->
+            val alpha by infinite.animateFloat(
+                initialValue = 0.3f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 500, delayMillis = index * 120),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "generating_dot_alpha_$index"
             )
-            Spacer(Modifier.width(10.dp))
-            PulsingDots()
+            Box(
+                modifier = Modifier
+                    .padding(horizontal = 1.5.dp)
+                    .size(dotSize)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = alpha))
+            )
         }
     }
 }

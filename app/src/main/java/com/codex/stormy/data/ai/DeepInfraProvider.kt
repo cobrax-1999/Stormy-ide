@@ -114,6 +114,9 @@ class DeepInfraProvider(
                 type: String?,
                 data: String
             ) {
+                // Always emit raw SSE data for debug logging
+                trySend(StreamEvent.RawSSE(data))
+
                 if (data == "[DONE]") {
                     // Emit final tool calls if any
                     if (toolCallsMap.isNotEmpty()) {
@@ -292,4 +295,10 @@ sealed class StreamEvent {
     data class FinishReason(val reason: String) : StreamEvent()
     data class Error(val message: String) : StreamEvent()
     data object Completed : StreamEvent()
+
+    /**
+     * Raw SSE event data for debug logging.
+     * Contains the unformatted, raw data received from the server.
+     */
+    data class RawSSE(val data: String) : StreamEvent()
 }
