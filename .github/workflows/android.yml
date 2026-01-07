@@ -1,68 +1,169 @@
-name: Build APK for Android 6.0
+name: 🚀 Stormy APK Production
 
+# ALL TRIGGERS as requested
 on:
-  push:
-    branches: [ main, master ]  # Auto-triggers on push to these branches
-  pull_request:
-    branches: [ main, master ]   # Optional: also runs on PRs
+  workflow_dispatch:           # Manual trigger
+  push:                        # Auto on push
+  pull_request:                # Auto on PR
+  schedule:
+    - cron: '0 0 * * 0'       # Weekly build (Sunday midnight)
+
+# PREVENT CONCURRENT BUILDS ON SAME BRANCH
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
     steps:
-    - name: Checkout code
+    # 1. CHECKOUT - with full history for version tagging
+    - name: 📦 Checkout repository
       uses: actions/checkout@v4
-
-    - name: Set up JDK 17
+      with:
+        fetch-depth: 0
+        
+    # 2. JDK SETUP
+    - name: ☕ Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
-
-    - name: Set up Android SDK
+        distribution: 'temurin'
+        
+    # 3. ANDROID SETUP with caching
+    - name: 🤖 Set up Android SDK
       uses: android-actions/setup-android@v3
-
-    - name: Check current minSdk and configure
-      id: check_sdk
+      
+    - name: 💾 Cache Gradle
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          gradle-${{ runner.os }}-
+          
+    # 4. SMART SDK VERSION HANDLING (error prevention)
+    - name: 🔍 Analyze & Fix Build Configuration
+      id: sdk_check
       run: |
-        # Find the current minSdk value in the build file
-        if grep -q "minSdk = " app/build.gradle.kts; then
-          CURRENT_SDK=$(grep "minSdk = " app/build.gradle.kts | grep -o '[0-9]*')
-        elif grep -q "minSdkVersion" app/build.gradle.kts; then
-          CURRENT_SDK=$(grep "minSdkVersion" app/build.gradle.kts | grep -o '[0-9]*' | head -1)
-        else
-          echo "Could not find minSdk in build.gradle.kts"
+        echo "=== BUILD CONFIGURATION ANALYSIS ==="
+        
+        # Find build file
+        BUILD_FILE="app/build.gradle.kts"
+        if [ ! -f "$BUILD_FILE" ]; then
+          echo "❌ ERROR: Build file not found at $BUILD_FILE"
           exit 1
         fi
         
-        echo "Current minSdk is: $CURRENT_SDK"
-        echo "CURRENT_SDK=$CURRENT_SDK" >> $GITHUB_OUTPUT
+        # Backup original
+        cp "$BUILD_FILE" "$BUILD_FILE.backup"
+        echo "✅ Backup created: $BUILD_FILE.backup"
         
-        # Only change if current SDK is > 23
-        if [ "$CURRENT_SDK" -gt 23 ]; then
-          echo "Changing minSdk from $CURRENT_SDK to 23 for this build"
-          cp app/build.gradle.kts app/build.gradle.kts.backup
-          sed -i "s/minSdk = $CURRENT_SDK/minSdk = 23/" app/build.gradle.kts || \
-          sed -i "s/minSdkVersion = $CURRENT_SDK/minSdkVersion = 23/" app/build.gradle.kts || \
-          echo "Note: Build file structure may differ. Check if minSdk was updated."
+        # Extract current minSdk
+        if grep -q "minSdk\s*=" "$BUILD_FILE"; then
+          CURRENT_SDK=$(grep "minSdk\s*=" "$BUILD_FILE" | grep -o '[0-9][0-9]*' | head -1)
+          PATTERN="minSdk"
+        elif grep -q "minSdkVersion" "$BUILD_FILE"; then
+          CURRENT_SDK=$(grep "minSdkVersion" "$BUILD_FILE" | grep -o '[0-9][0-9]*' | head -1)
+          PATTERN="minSdkVersion"
         else
-          echo "No change needed. Current minSdk ($CURRENT_SDK) is compatible with Android 6.0."
+          echo "⚠️  No minSdk found, defaulting to 23"
+          CURRENT_SDK="23"
+          PATTERN="none"
         fi
-
-    - name: Build Release APK
+        
+        echo "Current minSdk: $CURRENT_SDK"
+        echo "Pattern detected: $PATTERN"
+        
+        # Determine target SDK (prioritize compatibility)
+        if [ "$CURRENT_SDK" -gt 23 ]; then
+          echo "⚠️  Current minSdk ($CURRENT_SDK) > 23"
+          echo "Testing with minSdk = 23 for compatibility"
+          TARGET_SDK=23
+          SDK_CHANGED=true
+        else
+          echo "✅ Current minSdk ($CURRENT_SDK) is compatible with Android 6.0"
+          TARGET_SDK="$CURRENT_SDK"
+          SDK_CHANGED=false
+        fi
+        
+        # Apply change if needed
+        if [ "$SDK_CHANGED" = true ] && [ "$PATTERN" != "none" ]; then
+          sed -i "s/$PATTERN\s*=\s*$CURRENT_SDK/$PATTERN = $TARGET_SDK/" "$BUILD_FILE"
+          echo "🔧 Updated $PATTERN from $CURRENT_SDK to $TARGET_SDK"
+        fi
+        
+        # Output variables for later steps
+        echo "CURRENT_SDK=$CURRENT_SDK" >> $GITHUB_OUTPUT
+        echo "TARGET_SDK=$TARGET_SDK" >> $GITHUB_OUTPUT
+        echo "SDK_CHANGED=$SDK_CHANGED" >> $GITHUB_OUTPUT
+        echo "BUILD_FILE=$BUILD_FILE" >> $GITHUB_OUTPUT
+        
+        echo "=== ANALYSIS COMPLETE ==="
+    
+    # 5. GRADLE BUILD with error handling
+    - name: 🏗️ Build APK
+      id: build
+      continue-on-error: false
       run: |
+        echo "=== STARTING BUILD ==="
+        
+        # Make gradlew executable
         chmod +x gradlew
-        ./gradlew assembleRelease
-
-    - name: Restore original build file (if changed)
-      if: steps.check_sdk.outputs.CURRENT_SDK > 23
+        
+        # Build with detailed output
+        ./gradlew assembleRelease --stacktrace --no-daemon
+        
+        # Verify APK exists
+        APK_PATH="app/build/outputs/apk/release/app-release.apk"
+        if [ -f "$APK_PATH" ]; then
+          APK_SIZE=$(stat -f%z "$APK_PATH" 2>/dev/null || stat -c%s "$APK_PATH")
+          echo "✅ APK generated: $APK_PATH ($((APK_SIZE/1024/1024)) MB)"
+          echo "APK_PATH=$APK_PATH" >> $GITHUB_OUTPUT
+        else
+          echo "❌ ERROR: APK not found at $APK_PATH"
+          ls -la app/build/outputs/apk/release/ || true
+          exit 1
+        fi
+        
+    # 6. RESTORE original build file if changed
+    - name: ↩️ Restore Original Build Config
+      if: steps.sdk_check.outputs.SDK_CHANGED == 'true'
       run: |
-        mv app/build.gradle.kts.backup app/build.gradle.kts
-        echo "Restored original build.gradle.kts"
-
-    - name: Upload APK Artifact
-      if: success()  # Only upload if build succeeded
+        echo "Restoring original build configuration..."
+        mv "${{ steps.sdk_check.outputs.BUILD_FILE }}.backup" "${{ steps.sdk_check.outputs.BUILD_FILE }}"
+        echo "✅ Original configuration restored"
+        
+    # 7. UPLOAD ARTIFACTS
+    - name: 📤 Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: stormy-apk-android6
-        path: app/build/outputs/apk/release/app-release.apk
-        retention-days: 7
+        name: stormy-android6-apk
+        path: ${{ steps.build.outputs.APK_PATH }}
+        retention-days: 30
+        if-no-files-found: error
+        
+    # 8. CREATE RELEASE on tag push (optional automation)
+    - name: 🏷️ Create GitHub Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ steps.build.outputs.APK_PATH }}
+        generate_release_notes: true
+        prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') }}
+        
+    # 9. CLEANUP
+    - name: 🧹 Cleanup
+      if: always()
+      run: |
+        echo "=== CLEANUP ==="
+        echo "Build status: ${{ job.status }}"
+        
+        # Remove backup files
+        find . -name "*.backup" -type f -delete 2>/dev/null || true
+        
+        # Gradle cleanup
+        ./gradlew --stop 2>/dev/null || true
