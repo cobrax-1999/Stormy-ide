@@ -1,7 +1,10 @@
 name: Build APK for Android 6.0
 
 on:
-  workflow_dispatch: # Allows manual triggering only
+  push:
+    branches: [ main, master ]  # Auto-triggers on push to these branches
+  pull_request:
+    branches: [ main, master ]   # Optional: also runs on PRs
 
 jobs:
   build:
@@ -32,20 +35,17 @@ jobs:
         fi
         
         echo "Current minSdk is: $CURRENT_SDK"
+        echo "CURRENT_SDK=$CURRENT_SDK" >> $GITHUB_OUTPUT
         
-        # Determine if we need to change it
-        if [ "$CURRENT_SDK" -le 23 ]; then
-          echo "Current minSdk ($CURRENT_SDK) is <= 23. Building without changes."
-          echo "sdk_changed=false" >> $GITHUB_OUTPUT
-        else
-          echo "Current minSdk ($CURRENT_SDK) is > 23. Setting to 23 for this build."
-          echo "sdk_changed=true" >> $GITHUB_OUTPUT
-          
-          # Create a backup and change minSdk to 23
+        # Only change if current SDK is > 23
+        if [ "$CURRENT_SDK" -gt 23 ]; then
+          echo "Changing minSdk from $CURRENT_SDK to 23 for this build"
           cp app/build.gradle.kts app/build.gradle.kts.backup
           sed -i "s/minSdk = $CURRENT_SDK/minSdk = 23/" app/build.gradle.kts || \
           sed -i "s/minSdkVersion = $CURRENT_SDK/minSdkVersion = 23/" app/build.gradle.kts || \
-          echo "Manual update may be needed. Check build.gradle.kts structure."
+          echo "Note: Build file structure may differ. Check if minSdk was updated."
+        else
+          echo "No change needed. Current minSdk ($CURRENT_SDK) is compatible with Android 6.0."
         fi
 
     - name: Build Release APK
@@ -54,11 +54,13 @@ jobs:
         ./gradlew assembleRelease
 
     - name: Restore original build file (if changed)
-      if: steps.check_sdk.outputs.sdk_changed == 'true'
+      if: steps.check_sdk.outputs.CURRENT_SDK > 23
       run: |
         mv app/build.gradle.kts.backup app/build.gradle.kts
+        echo "Restored original build.gradle.kts"
 
     - name: Upload APK Artifact
+      if: success()  # Only upload if build succeeded
       uses: actions/upload-artifact@v4
       with:
         name: stormy-apk-android6
