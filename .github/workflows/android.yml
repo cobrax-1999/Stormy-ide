@@ -1,72 +1,66 @@
-name: Android CI
+name: Build APK for Android 6.0
 
 on:
-  push:
-    paths:
-      - '.github/workflows/android.yml'
-      - 'app/**'
-      - 'gradle/**'
-      - 'build.gradle.kts'
-      - 'gradle.properties'
-      - 'gradlew'
-      - 'gradlew.bat'
-      - 'settings.gradle.kts'
-      - 'keystore/**'
-    branches-ignore:
-      - 'wip/**'
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual triggering only
 
 jobs:
   build:
-    name: Build APKs
     runs-on: ubuntu-latest
-    outputs:
-      short_sha: ${{ steps.set_sha.outputs.short_sha }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: 17
-          distribution: temurin
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+    - name: Set up Android SDK
+      uses: android-actions/setup-android@v3
 
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
+    - name: Check current minSdk and configure
+      id: check_sdk
+      run: |
+        # Find the current minSdk value in the build file
+        if grep -q "minSdk = " app/build.gradle.kts; then
+          CURRENT_SDK=$(grep "minSdk = " app/build.gradle.kts | grep -o '[0-9]*')
+        elif grep -q "minSdkVersion" app/build.gradle.kts; then
+          CURRENT_SDK=$(grep "minSdkVersion" app/build.gradle.kts | grep -o '[0-9]*' | head -1)
+        else
+          echo "Could not find minSdk in build.gradle.kts"
+          exit 1
+        fi
+        
+        echo "Current minSdk is: $CURRENT_SDK"
+        
+        # Determine if we need to change it
+        if [ "$CURRENT_SDK" -le 23 ]; then
+          echo "Current minSdk ($CURRENT_SDK) is <= 23. Building without changes."
+          echo "sdk_changed=false" >> $GITHUB_OUTPUT
+        else
+          echo "Current minSdk ($CURRENT_SDK) is > 23. Setting to 23 for this build."
+          echo "sdk_changed=true" >> $GITHUB_OUTPUT
+          
+          # Create a backup and change minSdk to 23
+          cp app/build.gradle.kts app/build.gradle.kts.backup
+          sed -i "s/minSdk = $CURRENT_SDK/minSdk = 23/" app/build.gradle.kts || \
+          sed -i "s/minSdkVersion = $CURRENT_SDK/minSdkVersion = 23/" app/build.gradle.kts || \
+          echo "Manual update may be needed. Check build.gradle.kts structure."
+        fi
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+    - name: Build Release APK
+      run: |
+        chmod +x gradlew
+        ./gradlew assembleRelease
 
-      - name: Build Release APK
-        run: ./gradlew --no-daemon --stacktrace --build-cache assembleRelease
-        env:
-          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true"
+    - name: Restore original build file (if changed)
+      if: steps.check_sdk.outputs.sdk_changed == 'true'
+      run: |
+        mv app/build.gradle.kts.backup app/build.gradle.kts
 
-      - name: Set short SHA
-        id: set_sha
-        run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-
-      - name: Rename APK with commit hash
-        run: |
-          mv app/build/outputs/apk/release/app-release.apk \
-             app/build/outputs/apk/release/CodeX-release-${{ steps.set_sha.outputs.short_sha }}.apk
-
-      - name: Upload Release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: CodeX-release-${{ steps.set_sha.outputs.short_sha }}
-          path: app/build/outputs/apk/release/CodeX-release-${{ steps.set_sha.outputs.short_sha }}.apk
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: stormy-apk-android6
+        path: app/build/outputs/apk/release/app-release.apk
+        retention-days: 7
